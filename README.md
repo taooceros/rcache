@@ -1,11 +1,11 @@
 # rcache
 
-A copy-on-write rustc cache shared by every checkout on the machine: jj
-workspaces, git worktrees, plain clones. Each checkout keeps its own `target/`
-(so there is no shared Cargo lock and no cross-checkout staleness), but a
-compile that already happened anywhere is cloned in instead of rerun, and the
-clone shares data blocks with the stored copy (APFS `clonefile`, btrfs/XFS
-reflink).
+A shared rustc cache for every checkout on the machine: jj workspaces, git
+worktrees, plain clones. Each checkout keeps its own `target/` (so there is no
+shared Cargo lock and no cross-checkout staleness), but a compile that already
+happened anywhere is placed into it instead of rerun, sharing storage with the
+stored copy: a copy-on-write clone where the filesystem supports it (APFS
+`clonefile`, btrfs/XFS `FICLONE`), hard links on ext4 and the like.
 
 ## Install
 
@@ -22,8 +22,10 @@ rustc-wrapper = "/Users/you/.cargo/bin/rcache"
 
 `RCACHE_DISABLE=1` runs rustc untouched; `rcache stats` shows hits and time
 saved; `rcache gc [--max-size 40G]` and `rcache clear` manage the store
-(`~/Library/Caches/rcache`, or `$RCACHE_DIR`). Keep the store on the same
-volume as your checkouts, or entries become real copies.
+(`~/Library/Caches/rcache`, `~/.cache/rcache`, or `$RCACHE_DIR`). Keep the
+store on the same filesystem as your checkouts, or entries become real
+copies. `RCACHE_PLACE=link` forces the hard-link path (testing it on a
+copy-on-write filesystem); `RCACHE_PLACE=copy` disables sharing.
 
 ## Why not a shared `CARGO_TARGET_DIR` / `build-dir`
 
@@ -56,6 +58,30 @@ diagnostics to this checkout's paths, and stamps them with the current time.
 Inputs modified after the compile started are never stored. Registry and git
 crates (immutable sources) take a per-unit lock, so parallel agents building a
 fresh checkout compile each dependency once.
+
+## Without copy-on-write (ext4)
+
+Clones are independent files; hard links are the *same* file in the store and
+in every checkout, so the hard-link path follows these rules:
+
+- What gets linked: for workspace crates, what only the compiler reads
+  (rlibs, `.rmeta`, codegen objects); for registry and git crates, every
+  output (build scripts and proc macros included). Executables and
+  cdylibs/static libraries of workspace crates stay per-checkout copies:
+  tools and people copy or modify those. Dep-info is always rewritten.
+- A shared file's mtime is never touched (every other checkout would see its
+  dependencies change). Cargo marks a unit stale when a dependency's output is
+  newer than the unit's newest output, so when a dependency in this checkout
+  is newer than the store's copy — typically a build script that just ran
+  here — the unit's `.rmeta` (else every output Cargo tracks) becomes a
+  private copy stamped now.
+- Linked files are read-only, so an in-place write fails instead of
+  corrupting the store. Before compiling a unit, rcache unlinks its shared
+  outputs, so rustc and the linker only ever write fresh files.
+- `gc` evicts entries no checkout links any more first (link count 1),
+  least recently used first; removing a linked entry would free nothing.
+
+Per checkout this still costs the private copies; on clones it costs nothing.
 
 ## Limits
 

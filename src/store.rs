@@ -12,6 +12,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -102,10 +103,20 @@ impl Store {
         let _ = fsutil::set_mtime(&self.entry_dir(&m.id).join("manifest.json"), now);
     }
 
-    /// Stores clones of `outputs` from `out_dir`. Concurrent inserts of the
-    /// same id are fine: the first rename wins and the rest are dropped.
-    pub fn insert(&self, m: &Manifest, out_dir: &Path, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+    /// Stores `outputs` from `out_dir`: hard-linked (then read-only, see
+    /// [`shareable`]; `immutable` = registry/git crate), cloned or copied.
+    /// Concurrent inserts of the same id are fine: the first rename wins and
+    /// the rest are dropped.
+    pub fn insert(
+        &self,
+        m: &Manifest,
+        out_dir: &Path,
+        stdout: &[u8],
+        stderr: &[u8],
+        immutable: bool,
+    ) -> Result<fsutil::Placements> {
         let dest = self.entry_dir(&m.id);
+        let mut placements = fsutil::Placements::default();
         if !dest.exists() {
             let tmp = self.root.join("tmp").join(format!(
                 "{}-{}-{}",
@@ -116,8 +127,14 @@ impl Store {
             let staged = (|| -> Result<()> {
                 fs::create_dir_all(tmp.join("out"))?;
                 for name in &m.outputs {
-                    fsutil::copy_tree(&out_dir.join(name), &tmp.join("out").join(name))
-                        .with_context(|| format!("storing {name}"))?;
+                    let stored = tmp.join("out").join(name);
+                    let placed =
+                        fsutil::place(&out_dir.join(name), &stored, shareable(name, immutable))
+                            .with_context(|| format!("storing {name}"))?;
+                    if placed == fsutil::Placed::Linked {
+                        fsutil::make_readonly(&stored)?;
+                    }
+                    placements.add(placed);
                 }
                 fs::write(tmp.join("stdout"), stdout)?;
                 fs::write(tmp.join("stderr"), stderr)?;
@@ -135,7 +152,7 @@ impl Store {
         fs::create_dir_all(self.root.join("index").join(&m.primary))?;
         File::create(self.index_file(&m.primary, &m.id))?;
         self.maybe_gc();
-        Ok(())
+        Ok(placements)
     }
 
     fn index_file(&self, primary: &str, id: &str) -> PathBuf {
@@ -209,25 +226,32 @@ impl Store {
         }
     }
 
-    /// Evicts least recently used entries until the logical size fits.
-    /// Logical size over-counts disk use: entries share blocks with the
-    /// target directories they were cloned from or into.
+    /// Evicts entries until the logical size fits: first, least recently
+    /// used first, entries no checkout hard-links any more; then the rest.
+    /// A linked entry still holds data a target directory uses, so removing
+    /// it frees nothing until that checkout rebuilds or is deleted. Logical
+    /// size over-counts disk use for the same reason (and for clones).
     pub fn gc(&self, max_bytes: u64) -> Result<GcReport> {
-        let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+        let mut entries: Vec<(bool, SystemTime, u64, PathBuf)> = Vec::new();
         for entry in fs::read_dir(self.root.join("entries"))?.flatten() {
             let path = entry.path();
             let used = fs::metadata(path.join("manifest.json"))
                 .and_then(|m| m.modified())
                 .unwrap_or(UNIX_EPOCH);
-            entries.push((used, fsutil::tree_size(&path), path));
+            let linked = fs::read_dir(path.join("out"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|f| f.metadata().is_ok_and(|m| m.is_file() && m.nlink() > 1));
+            entries.push((linked, used, fsutil::tree_size(&path), path));
         }
         entries.sort();
         let mut report = GcReport {
             entries: entries.len(),
-            bytes: entries.iter().map(|e| e.1).sum(),
+            bytes: entries.iter().map(|e| e.2).sum(),
             ..GcReport::default()
         };
-        for (_, size, path) in &entries {
+        for (_, _, size, path) in &entries {
             if report.bytes <= max_bytes {
                 break;
             }
@@ -277,6 +301,21 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Whether output `name` may be one hard-linked, read-only file shared by the
+/// store and every checkout. Dep-info never is (it is rewritten per
+/// checkout). For registry and git crates everything else is: only rustc,
+/// linkers and Cargo (running build scripts) read those. For workspace crates
+/// only what the compiler reads — rlibs, `.rmeta`, codegen objects —
+/// executables and cdylibs/static libs are handed to tools and people, which
+/// may copy or modify them in place.
+pub fn shareable(name: &str, immutable: bool) -> bool {
+    !name.ends_with(".d")
+        && (immutable
+            || name.ends_with(".rlib")
+            || name.ends_with(".rmeta")
+            || name.ends_with(".o"))
 }
 
 #[derive(Debug, Default)]

@@ -15,7 +15,7 @@
 //! dependent's key is the same in every workspace even though rlibs embed
 //! workspace-specific absolute paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -24,7 +24,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -32,7 +32,7 @@ use crate::args::{self, Arg, Invocation};
 use crate::depinfo;
 use crate::fsutil;
 use crate::paths::{Roots, replace_roots, replace_roots_bytes};
-use crate::store::{Input, Manifest, Store, VERSION};
+use crate::store::{self, Input, Manifest, Store, VERSION};
 
 const KEY_VERSION: &str = "rcache-key-1";
 /// Candidates checked per lookup; older ones are effectively dead.
@@ -104,7 +104,7 @@ struct Identity {
 }
 
 enum Saved {
-    Stored,
+    Stored(fsutil::Placements),
     Skipped(&'static str),
 }
 
@@ -199,11 +199,12 @@ impl<'a> Job<'a> {
         let t0 = Instant::now();
         if let Some(m) = self.lookup() {
             match self.materialize(&m) {
-                Ok(()) => {
+                Ok(placed) => {
                     self.replay(&m);
                     self.store.touch(&m);
                     let ms = t0.elapsed().as_millis() as u64;
-                    self.store.log("hit", &crate_name, ms, m.compile_ms, "");
+                    self.store
+                        .log("hit", &crate_name, ms, m.compile_ms, &placed.to_string());
                     return 0;
                 }
                 Err(e) => self.store.log(
@@ -216,6 +217,7 @@ impl<'a> Job<'a> {
             }
         }
 
+        self.break_links();
         let start = SystemTime::now();
         let t0 = Instant::now();
         let early = Mutex::new(None::<String>);
@@ -236,7 +238,10 @@ impl<'a> Job<'a> {
             return code;
         }
         match self.save(start, compile_ms, &stdout, &stderr, early.as_deref()) {
-            Ok(Saved::Stored) => self.store.log("miss", &crate_name, compile_ms, 0, ""),
+            Ok(Saved::Stored(placed)) => {
+                self.store
+                    .log("miss", &crate_name, compile_ms, 0, &placed.to_string())
+            }
             Ok(Saved::Skipped(why)) => {
                 self.untag_outputs();
                 self.store.log("nostore", &crate_name, compile_ms, 0, why);
@@ -413,15 +418,17 @@ impl<'a> Job<'a> {
             dep_info,
             compile_ms,
         };
-        self.store
-            .insert(&manifest, &self.out_dir, stdout, stderr)?;
+        // Tag first: a stored output may come back hard-linked and read-only.
         for name in &manifest.outputs {
             let path = self.out_dir.join(name);
             if path.is_file() {
                 fsutil::tag(&path, &manifest.id)?;
             }
         }
-        Ok(Saved::Stored)
+        let placed = self
+            .store
+            .insert(&manifest, &self.out_dir, stdout, stderr, self.immutable)?;
+        Ok(Saved::Stored(placed))
     }
 
     /// This unit's files in `--out-dir` written by the compile that just ran.
@@ -445,53 +452,164 @@ impl<'a> Job<'a> {
         Ok(out)
     }
 
-    fn untag_outputs(&self) {
+    /// This unit's existing files in `--out-dir`.
+    fn unit_files(&self) -> Vec<PathBuf> {
         let stem = self.inv.stem();
         let lib = format!("lib{stem}");
-        for entry in fs::read_dir(&self.out_dir).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if is_unit_file(&name, &stem) || is_unit_file(&name, &lib) {
-                fsutil::untag(&entry.path());
+        fs::read_dir(&self.out_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                is_unit_file(&name, &stem) || is_unit_file(&name, &lib)
+            })
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// Unlinks this unit's outputs that are shared with the store, so rustc
+    /// and the linker only ever write fresh files, never through a link.
+    fn break_links(&self) {
+        for path in self.unit_files() {
+            if fs::symlink_metadata(&path).is_ok_and(|m| fsutil::is_shared(&m)) {
+                let _ = fs::remove_file(&path);
             }
         }
     }
 
-    /// Clones the entry's outputs into `--out-dir` (dep-info rewritten to this
-    /// workspace), stamped with the current time like a fresh compile.
-    fn materialize(&self, m: &Manifest) -> Result<()> {
+    fn untag_outputs(&self) {
+        for path in self.unit_files() {
+            // A shared file's tag belongs to its store entry.
+            if fs::symlink_metadata(&path).is_ok_and(|m| !fsutil::is_shared(&m)) {
+                fsutil::untag(&path);
+            }
+        }
+    }
+
+    /// Places the entry's outputs into `--out-dir`: shareable ones hard-linked
+    /// when the filesystem cannot clone (the same file as the store's, mtime
+    /// untouched), the rest as private files stamped with the current time
+    /// like a fresh compile; dep-info rewritten to this workspace.
+    fn materialize(&self, m: &Manifest) -> Result<fsutil::Placements> {
         let src = self.store.entry_dir(&m.id).join("out");
         let now = SystemTime::now();
+        let share = self.share_set(m, &src);
+        let mut placements = fsutil::Placements::default();
         for name in &m.outputs {
             let dst = self.out_dir.join(name);
             let tmp = self
                 .out_dir
                 .join(format!(".rcache-{}-{name}", std::process::id()));
-            let placed = (|| -> Result<()> {
-                if *name == m.dep_info {
+            let placed = (|| -> Result<fsutil::Placed> {
+                let placed = if *name == m.dep_info {
                     let text = fs::read_to_string(src.join(name))?;
                     fs::write(&tmp, self.rewrite_dep_info(m, &text))?;
+                    fsutil::Placed::Copied
                 } else {
-                    fsutil::copy_tree(&src.join(name), &tmp)?;
-                }
-                if tmp.is_file() {
+                    fsutil::place(&src.join(name), &tmp, share.contains(name.as_str()))?
+                };
+                let private = placed != fsutil::Placed::Linked && tmp.is_file();
+                if private {
                     fsutil::set_mtime(&tmp, now)?;
                 }
                 if dst.is_dir() {
                     fsutil::remove_tree(&dst)?;
                 }
                 fs::rename(&tmp, &dst)?;
-                if dst.is_file() {
+                // Renaming a link onto another link of the same file is a
+                // no-op that leaves `tmp` behind (POSIX).
+                if fs::symlink_metadata(&tmp).is_ok() {
+                    fs::remove_file(&tmp)?;
+                }
+                if private {
                     fsutil::tag(&dst, &m.id)?;
                 }
-                Ok(())
+                Ok(placed)
             })();
-            if let Err(e) = placed {
-                let _ = fsutil::remove_tree(&tmp);
-                return Err(e.context(format!("placing {name}")));
+            match placed {
+                Ok(placed) => placements.add(placed),
+                Err(e) => {
+                    let _ = fsutil::remove_tree(&tmp);
+                    return Err(e.context(format!("placing {name}")));
+                }
             }
         }
-        Ok(())
+        Ok(placements)
+    }
+
+    /// Outputs to hard-link. Cargo marks a unit stale when one of its
+    /// dependencies' outputs is newer than the unit's newest output; a linked
+    /// output keeps the store's mtime (when it was first compiled), which
+    /// can be older than a dependency produced in this checkout — typically a
+    /// build script that just ran here. Then the `.rmeta` (else every output
+    /// Cargo tracks) stays private, stamped now.
+    fn share_set<'m>(&self, m: &'m Manifest, src: &Path) -> HashSet<&'m str> {
+        let mut share: HashSet<&str> = m
+            .outputs
+            .iter()
+            .filter(|o| store::shareable(o, self.immutable))
+            .map(String::as_str)
+            .collect();
+        let tracked: Vec<&str> = m
+            .outputs
+            .iter()
+            .map(String::as_str)
+            .filter(|o| !o.ends_with(".d") && !o.ends_with(".o"))
+            .collect();
+        if tracked.is_empty() || !tracked.iter().all(|o| share.contains(o)) {
+            return share;
+        }
+        let newest = tracked
+            .iter()
+            .filter_map(|o| fs::metadata(src.join(o)).and_then(|m| m.modified()).ok())
+            .max()
+            .unwrap_or(UNIX_EPOCH);
+        if self.dependencies_mtime() > newest {
+            match tracked.iter().find(|o| o.ends_with(".rmeta")) {
+                Some(rmeta) => {
+                    share.remove(rmeta);
+                }
+                None => share.retain(|o| !tracked.contains(o)),
+            }
+        }
+        share
+    }
+
+    /// Newest output, in this checkout, of anything Cargo checks this unit
+    /// against: every `--extern` crate (all files of its unit) and the build
+    /// script run. Unreadable means "now", which keeps a private output.
+    fn dependencies_mtime(&self) -> SystemTime {
+        let mut newest = UNIX_EPOCH;
+        let mut see = |path: &Path| match fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(t) => newest = newest.max(t),
+            Err(_) => newest = SystemTime::now(),
+        };
+        for arg in &self.inv.args {
+            let Arg::Value(flag, v) = arg else { continue };
+            let Some((_, path)) = v.split_once('=').filter(|_| flag == "--extern") else {
+                continue;
+            };
+            let path = self.roots.absolute(Path::new(path));
+            let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+                continue;
+            };
+            let stem = stem.to_string_lossy();
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                if is_unit_file(&entry.file_name().to_string_lossy(), &stem) {
+                    see(&entry.path());
+                }
+            }
+        }
+        if let Some(out) = env::var_os("OUT_DIR") {
+            let out = PathBuf::from(out);
+            see(&out);
+            if let Some(run) = out.parent() {
+                see(&run.join("output"));
+            }
+        }
+        newest
     }
 
     fn rewrite_dep_info(&self, m: &Manifest, text: &str) -> String {
