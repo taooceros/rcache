@@ -26,12 +26,32 @@ pub fn hash_file_normalized(path: &Path, pats: &[(&[u8], &[u8])]) -> io::Result<
 }
 
 /// Hash of a directory tree: names, symlink targets and normalized contents.
+/// autocfg's probe leftovers at the top level are skipped (see
+/// [`autocfg_probe`]).
 pub fn hash_tree(root: &Path, pats: &[(&[u8], &[u8])]) -> io::Result<String> {
     let mut h = blake3::Hasher::new();
     if root.is_dir() {
         hash_dir(root, "", pats, &mut h)?;
     }
     Ok(h.finalize().to_hex().to_string())
+}
+
+/// `autocfg_<16 hex digits>_<n>[.ext]`: what autocfg's compiler probes leave
+/// in a build script's OUT_DIR. The hex part is random per build script run
+/// (and repeated inside the file), and the crate never reads these files, so
+/// hashing them would give every crate built with autocfg a new key each time.
+fn autocfg_probe(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+    let Some(rest) = stem.strip_prefix("autocfg_") else {
+        return false;
+    };
+    let Some((uuid, n)) = rest.split_once('_') else {
+        return false;
+    };
+    uuid.len() == 16
+        && uuid.bytes().all(|b| b.is_ascii_hexdigit())
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn hash_dir(
@@ -43,8 +63,13 @@ fn hash_dir(
     let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
-        let name = format!("{rel}/{}", entry.file_name().to_string_lossy());
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
         let ty = entry.file_type()?;
+        if rel.is_empty() && ty.is_file() && autocfg_probe(&file_name) {
+            continue;
+        }
+        let name = format!("{rel}/{file_name}");
         let (kind, value) = if ty.is_symlink() {
             (
                 "L",
@@ -319,5 +344,42 @@ mod tests {
         assert_eq!(ha, hb);
         fs::write(b.join("sub/obj.o"), "/w/b/t/out/y.o").unwrap();
         assert_ne!(ha, hash_tree(&b, &[(b"/w/b/t", b"$T")]).unwrap());
+    }
+
+    #[test]
+    fn tree_hash_skips_autocfg_probes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = |name: &str, extra: &[(&str, &str)]| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("gen.rs"), "pub const X: u8 = 1;").unwrap();
+            for (rel, body) in extra {
+                fs::write(root.join(rel), body).unwrap();
+            }
+            hash_tree(&root, &[]).unwrap()
+        };
+        let plain = tree("plain", &[]);
+        let probe = |uuid: &str| {
+            let name = format!("autocfg_{uuid}_0");
+            (format!("{name}.ll"), format!("; ModuleID = '{name}'"))
+        };
+        for (i, uuid) in ["90d41b4e4b6cc141", "0f3a5c7e9b1d2f40"]
+            .into_iter()
+            .enumerate()
+        {
+            let (rel, body) = probe(uuid);
+            assert_eq!(tree(&format!("probe{i}"), &[(&rel, &body)]), plain);
+        }
+        // Anything else still counts, also names that only look similar.
+        for (i, rel) in [
+            "autocfg_90d41b4e4b6cc141.ll",
+            "autocfg_xyz_0.ll",
+            "sub/autocfg_90d41b4e4b6cc141_0.ll",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_ne!(tree(&format!("other{i}"), &[(rel, "x")]), plain, "{rel}");
+        }
     }
 }

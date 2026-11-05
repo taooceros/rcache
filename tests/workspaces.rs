@@ -41,7 +41,8 @@ impl Sandbox {
     /// embeds the absolute OUT_DIR, like most code generators do, and depends
     /// on `ext`, a crate outside every workspace. Like registry crates, Cargo
     /// compiles it with its own directory as cwd; like many of them it has a
-    /// build script, which reruns in every new checkout.
+    /// build script, which reruns in every new checkout and, like autocfg's
+    /// probes, leaves a file with a random name and content in OUT_DIR.
     fn workspace(&self, name: &str, greeting: &str, print_manifest_dir: bool) -> PathBuf {
         write(
             &self.root,
@@ -51,7 +52,15 @@ impl Sandbox {
         write(
             &self.root,
             "ext/build.rs",
-            "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+            r#"use std::hash::{BuildHasher, Hasher};
+fn main() {
+    let uuid = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let probe = format!("autocfg_{uuid:016x}_0");
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/{probe}.ll"), format!("; ModuleID = '{probe}'\n")).unwrap();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"#,
         );
         write(
             &self.root,
